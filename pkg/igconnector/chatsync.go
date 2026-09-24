@@ -47,7 +47,9 @@ func (ic *IGClient) processMailbox(ctx, retryCtx context.Context, mailbox *slide
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to save thread mappings")
 		}
-		events = append(events, ic.wrapChatResync(node.Node.AsIGDirectThread, false))
+		if ic.Main.Config.ThreadBackfill.BatchCount != 0 {
+			events = append(events, ic.wrapChatResync(node.Node.AsIGDirectThread, false))
+		}
 	}
 	if retryCtx.Err() != nil {
 		done()

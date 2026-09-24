@@ -24,8 +24,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"go.mau.fi/util/jsontime"
-	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/variationselector"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -296,54 +294,6 @@ func (ic *IGClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2
 }
 
 func (ic *IGClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
-	if ic.LoginMeta.Cookies == nil {
-		return bridgev2.ErrNotLoggedIn
-	}
-	meta, err := ic.ensureIGID(ctx, receipt.Portal)
-	if err != nil {
-		return err
-	}
-	if !receipt.ReadUpTo.After(receipt.LastRead) {
-		return nil
-	}
-	readUpTo := receipt.ExactMessage
-	if readUpTo == nil {
-		var err error
-		readUpTo, err = receipt.Portal.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(ctx, receipt.Portal.PortalKey, receipt.ReadUpTo)
-		if err != nil {
-			return fmt.Errorf("failed to get last read message: %w", err)
-		} else if readUpTo == nil {
-			return fmt.Errorf("last read message not found")
-		}
-	}
-	messageID, ok := metaid.ParseMessageID(readUpTo.ID).(metaid.ParsedFBMessageID)
-	if !ok {
-		return fmt.Errorf("unexpected parsed message ID type")
-	}
-	resp1, err := ic.Client.MarkRead(ctx, &slidetypes.MarkReadRequest{
-		Metadata: slidetypes.MarkReadMetadata{IGThreadIGID: meta.IGThreadID},
-		Data: slidetypes.MarkReadData{
-			MessageID: messageID.ID,
-			ItemID:    ptr.Ptr(""),
-		},
-	})
-	if err != nil {
-		return err
-	}
-	resp2, err := ic.Client.MarkReadValidation(ctx, &slidetypes.MarkReadRequest{
-		Metadata: slidetypes.MarkReadMetadata{IGThreadIGID: meta.IGThreadID},
-		Data: slidetypes.MarkReadData{
-			MessageID:          messageID.ID,
-			MessageTimestampMS: jsontime.UnixMilliString{Time: readUpTo.Timestamp},
-		},
-	})
-	if err != nil {
-		return err
-	}
-	zerolog.Ctx(ctx).Trace().
-		Any("mark_read_resp", resp1).
-		Any("validation_resp", resp2).
-		Msg("Sent read receipt to Instagram")
 	return nil
 }
 
