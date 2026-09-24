@@ -63,3 +63,5 @@ require (
 )
 
 replace github.com/imroc/req/v3 => github.com/beeper/req/v3 v3.0.0-20260703124114-47a4e2aa147e
+
+replace maunium.net/go/mautrix => github.com/almeidandres/go v0.30.0-panda.0

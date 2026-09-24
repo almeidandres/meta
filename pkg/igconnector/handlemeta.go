@@ -150,6 +150,13 @@ func (ic *IGClient) handleIGEvent(ctx context.Context, rawEvt slidetypes.ClientE
 		if err := ic.doWaitMailboxProcessed(ctx); err != nil {
 			return err
 		}
+		staged, err := ic.stageBootstrapDelta(ctx, evt)
+		if err != nil {
+			return err
+		}
+		if staged {
+			return nil
+		}
 		return ic.handleDelta(ctx, evt)
 	case *slidetypes.TypingNotification:
 		return ic.handleTyping(ctx, evt)
@@ -178,6 +185,10 @@ func (ic *IGClient) wrapChatResync(thread *slidetypes.ThreadInfo, useBundle bool
 }
 
 func (ic *IGClient) getAndResyncThread(ctx context.Context, threadIGID string) (networkid.PortalKey, error) {
+	return ic.getAndResyncThreadWithDispatcher(ctx, threadIGID, ic.UserLogin.QueueRemoteEvent)
+}
+
+func (ic *IGClient) getAndResyncThreadWithDispatcher(ctx context.Context, threadIGID string, send deltaDispatcher) (networkid.PortalKey, error) {
 	resp, err := ic.Client.GetThread(ctx, slidetypes.MakeGetThreadInfoRequest(threadIGID))
 	if err != nil {
 		return networkid.PortalKey{}, fmt.Errorf("failed to get thread info for %s: %w", threadIGID, err)
@@ -191,7 +202,7 @@ func (ic *IGClient) getAndResyncThread(ctx context.Context, threadIGID string) (
 		return networkid.PortalKey{}, fmt.Errorf("failed to save FBID for IG thread %s: %w", threadIGID, err)
 	}
 	evt := ic.wrapChatResync(resp.ThreadInfo.AsIGDirectThread, true)
-	res := ic.UserLogin.QueueRemoteEvent(evt)
+	res := send(evt)
 	if !res.Success {
 		return evt.PortalKey, res.Error
 	}
@@ -219,7 +230,13 @@ func (ic *IGClient) ensurePortal(ctx context.Context, threadIGID string, allowCr
 	return key, true, err
 }
 
+type deltaDispatcher func(bridgev2.RemoteEvent) bridgev2.EventHandlingResult
+
 func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) error {
+	return ic.handleDeltaWithDispatcher(ctx, d, ic.UserLogin.QueueRemoteEvent, false)
+}
+
+func (ic *IGClient) handleDeltaWithDispatcher(ctx context.Context, d *slidetypes.Delta, send deltaDispatcher, replay bool) (retErr error) {
 	defer func() {
 		v := recover()
 		if v != nil {
@@ -227,6 +244,7 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) error 
 			if !ok {
 				err = fmt.Errorf("%v", v)
 			}
+			retErr = fmt.Errorf("Instagram delta handler panicked: %w", err)
 			stack := debug.Stack()
 			zerolog.Ctx(ctx).Err(err).
 				Bytes(zerolog.ErrorStackFieldName, stack).
@@ -279,48 +297,51 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) error 
 	var res bridgev2.EventHandlingResult
 	switch evt := d.Data.(type) {
 	case *slidetypes.NewMessageEvent:
-		res = ic.handleMessage(portalKey, evt.Message)
+		res = ic.handleMessage(portalKey, evt.Message, send)
 	case *slidetypes.AdminMessageEvent:
-		res = ic.handleMessage(portalKey, evt.Message)
+		res = ic.handleMessage(portalKey, evt.Message, send)
 	case *slidetypes.EditMessageEvent:
-		res = ic.handleEdit(portalKey, evt)
+		res = ic.handleEdit(portalKey, evt, send)
 	case *slidetypes.CreateReactionEvent:
-		res = ic.handleReaction(ctx, portalKey, evt)
+		res = ic.handleReaction(ctx, portalKey, evt, send)
 	case *slidetypes.DeleteReactionEvent:
-		res = ic.handleReactionDelete(ctx, portalKey, evt)
+		res = ic.handleReactionDelete(ctx, portalKey, evt, send)
 	case *slidetypes.DeleteMessageEvent:
-		res = ic.handleMessageDelete(portalKey, evt.MessageID)
+		res = ic.handleMessageDelete(portalKey, evt.MessageID, send)
 	case *slidetypes.DeleteThreadEvent:
-		res = ic.handleThreadDelete(portalKey)
+		res = ic.handleThreadDelete(portalKey, send)
 	case *slidetypes.PinThreadEvent:
-		res = ic.handleThreadPin(portalKey, evt.IsPinned)
+		res = ic.handleThreadPin(portalKey, evt.IsPinned, send)
 	case *slidetypes.UpdateThreadFolderEvent:
-		res = ic.handleThreadFolder(portalKey, evt.Folder)
+		res = ic.handleThreadFolder(portalKey, evt.Folder, send)
 	case *slidetypes.UpdateThreadNameEvent:
-		res = ic.handleThreadName(portalKey, evt)
+		res = ic.handleThreadName(portalKey, evt, send)
 	case *slidetypes.UpdateThreadImageEvent:
-		res = ic.handleThreadImage(portalKey, evt)
+		res = ic.handleThreadImage(portalKey, evt, send)
 	case *slidetypes.ParticipantJoinEvent:
-		res = ic.handleGroupJoin(portalKey, evt)
+		res = ic.handleGroupJoin(portalKey, evt, send)
 	case *slidetypes.ParticipantLeaveEvent:
-		res = ic.handleGroupLeave(portalKey, evt)
+		res = ic.handleGroupLeave(portalKey, evt, send)
 	case *slidetypes.AdminChangeEvent:
 		// The event shape isn't great for making a chat info change event, just resync the chat info entirely
 		if !didResync {
-			_, err = ic.getAndResyncThread(ctx, d.ThreadIGID)
+			_, err = ic.getAndResyncThreadWithDispatcher(ctx, d.ThreadIGID, send)
 		}
 		return err
 	case *slidetypes.MarkReadEvent:
-		res = ic.dispatchRead(portalKey, ic.selfEventSender(), evt.ReadTimestampMS.Time)
+		res = ic.dispatchRead(portalKey, ic.selfEventSender(), evt.ReadTimestampMS.Time, send)
 	case *slidetypes.MarkUnreadEvent:
-		res = ic.dispatchUnread(portalKey, evt.MarkedAsUnread)
+		res = ic.dispatchUnread(portalKey, evt.MarkedAsUnread, send)
 	case *slidetypes.ReadReceiptEvent:
-		res = ic.dispatchRead(portalKey, ic.makeEventSender(evt.ReadReceipt.ParticipantFBID), evt.ReadReceipt.WatermarkTimestampMS.Time)
+		res = ic.dispatchRead(portalKey, ic.makeEventSender(evt.ReadReceipt.ParticipantFBID), evt.ReadReceipt.WatermarkTimestampMS.Time, send)
 	case *slidetypes.MuteThreadEvent:
-		res = ic.handleMuteThread(portalKey, evt.IsMutedNow)
+		res = ic.handleMuteThread(portalKey, evt.IsMutedNow, send)
 	case *slidetypes.PinMessageEvent:
-		res = ic.handlePinMessages(portalKey, evt)
+		res = ic.handlePinMessages(portalKey, evt, send)
 	case slidetypes.UnknownEvent:
+		if replay {
+			return fmt.Errorf("unsupported staged Instagram delta %s", d.TypeName)
+		}
 		log.Warn().
 			Str("typename", d.TypeName).
 			Str("thread_fbid", d.ThreadIGID).
@@ -346,10 +367,10 @@ func (ic *IGClient) makeMessageEventMeta(portalKey networkid.PortalKey, msg *sli
 	}
 }
 
-func (ic *IGClient) handleMessage(portalKey networkid.PortalKey, msg *slidetypes.Message) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleMessage(portalKey networkid.PortalKey, msg *slidetypes.Message, send deltaDispatcher) bridgev2.EventHandlingResult {
 	msgID := metaid.MakeFBMessageID(msg.ID)
 	ic.updateGhostFromEvent(msg.Sender)
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.Message[*slidetypes.Message]{
+	return send(&simplevent.Message[*slidetypes.Message]{
 		EventMeta: ic.makeMessageEventMeta(portalKey, msg, bridgev2.RemoteEventMessage),
 		//TransactionID: msg.OfflineThreadingID,
 		Data: msg,
@@ -382,9 +403,9 @@ func (ic *IGClient) updateGhostFromEvent(sender *slidetypes.MessageSender) {
 	}
 }
 
-func (ic *IGClient) handleEdit(portalKey networkid.PortalKey, evt *slidetypes.EditMessageEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleEdit(portalKey networkid.PortalKey, evt *slidetypes.EditMessageEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	msgID := metaid.MakeFBMessageID(evt.MessageID)
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.Message[string]{
+	return send(&simplevent.Message[string]{
 		EventMeta: simplevent.EventMeta{
 			Type:        bridgev2.RemoteEventEdit,
 			PortalKey:   portalKey,
@@ -413,12 +434,12 @@ func (ic *IGClient) handleEdit(portalKey networkid.PortalKey, evt *slidetypes.Ed
 	})
 }
 
-func (ic *IGClient) handleReaction(ctx context.Context, portalKey networkid.PortalKey, evt *slidetypes.CreateReactionEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleReaction(ctx context.Context, portalKey networkid.PortalKey, evt *slidetypes.CreateReactionEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	err := ic.Main.DB.PutIGReaction(ctx, portalKey, evt.MessageID, evt.Reaction.SenderFBID, evt.Reaction.LogMessageID)
 	if err != nil {
 		return bridgev2.EventHandlingResultFailed.WithError(fmt.Errorf("failed to store reaction mapping in db: %w", err))
 	}
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.Reaction{
+	return send(&simplevent.Reaction{
 		EventMeta: simplevent.EventMeta{
 			Type:        bridgev2.RemoteEventReaction,
 			PortalKey:   portalKey,
@@ -431,7 +452,7 @@ func (ic *IGClient) handleReaction(ctx context.Context, portalKey networkid.Port
 	})
 }
 
-func (ic *IGClient) handleReactionDelete(ctx context.Context, portalKey networkid.PortalKey, evt *slidetypes.DeleteReactionEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleReactionDelete(ctx context.Context, portalKey networkid.PortalKey, evt *slidetypes.DeleteReactionEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	targetMsgID := evt.MessageID
 	reactionSenderFBID := evt.Reaction.SenderFBID
 	if reactionSenderFBID == 0 {
@@ -448,7 +469,7 @@ func (ic *IGClient) handleReactionDelete(ctx context.Context, portalKey networki
 			return bridgev2.EventHandlingResultIgnored
 		}
 	}
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.Reaction{
+	return send(&simplevent.Reaction{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReactionRemove,
 			PortalKey: portalKey,
@@ -458,8 +479,8 @@ func (ic *IGClient) handleReactionDelete(ctx context.Context, portalKey networki
 	})
 }
 
-func (ic *IGClient) handleMessageDelete(portalKey networkid.PortalKey, id string) bridgev2.EventHandlingResult {
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.MessageRemove{
+func (ic *IGClient) handleMessageDelete(portalKey networkid.PortalKey, id string, send deltaDispatcher) bridgev2.EventHandlingResult {
+	return send(&simplevent.MessageRemove{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessageRemove,
 			PortalKey: portalKey,
@@ -468,8 +489,8 @@ func (ic *IGClient) handleMessageDelete(portalKey networkid.PortalKey, id string
 	})
 }
 
-func (ic *IGClient) handleThreadDelete(portalKey networkid.PortalKey) bridgev2.EventHandlingResult {
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.ChatDelete{
+func (ic *IGClient) handleThreadDelete(portalKey networkid.PortalKey, send deltaDispatcher) bridgev2.EventHandlingResult {
+	return send(&simplevent.ChatDelete{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatDelete,
 			PortalKey: portalKey,
@@ -478,9 +499,9 @@ func (ic *IGClient) handleThreadDelete(portalKey networkid.PortalKey) bridgev2.E
 	})
 }
 
-func (ic *IGClient) handleThreadFolder(portalKey networkid.PortalKey, folder string) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleThreadFolder(portalKey networkid.PortalKey, folder string, send deltaDispatcher) bridgev2.EventHandlingResult {
 	isRequest := folder == "PENDING" || folder == "SPAM"
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+	return send(&simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatInfoChange,
 			PortalKey:    portalKey,
@@ -492,12 +513,12 @@ func (ic *IGClient) handleThreadFolder(portalKey networkid.PortalKey, folder str
 	})
 }
 
-func (ic *IGClient) handleThreadPin(portalKey networkid.PortalKey, isPinned bool) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleThreadPin(portalKey networkid.PortalKey, isPinned bool, send deltaDispatcher) bridgev2.EventHandlingResult {
 	var tag event.RoomTag
 	if isPinned {
 		tag = event.RoomTagFavourite
 	}
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+	return send(&simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatInfoChange,
 			PortalKey:    portalKey,
@@ -517,6 +538,7 @@ func (ic *IGClient) handleMessageChatInfoChange(
 	portalKey networkid.PortalKey,
 	msg *slidetypes.Message,
 	change *bridgev2.ChatInfo,
+	send deltaDispatcher,
 	members ...bridgev2.ChatMember,
 ) bridgev2.EventHandlingResult {
 	var memberChanges *bridgev2.ChatMemberList
@@ -528,7 +550,7 @@ func (ic *IGClient) handleMessageChatInfoChange(
 			memberChanges.MemberMap.Add(m)
 		}
 	}
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+	return send(&simplevent.ChatInfoChange{
 		EventMeta: ic.makeMessageEventMeta(portalKey, msg, bridgev2.RemoteEventChatInfoChange),
 		ChatInfoChange: &bridgev2.ChatInfoChange{
 			ChatInfo:      change,
@@ -537,19 +559,19 @@ func (ic *IGClient) handleMessageChatInfoChange(
 	})
 }
 
-func (ic *IGClient) handleThreadName(portalKey networkid.PortalKey, evt *slidetypes.UpdateThreadNameEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleThreadName(portalKey networkid.PortalKey, evt *slidetypes.UpdateThreadNameEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	return ic.handleMessageChatInfoChange(portalKey, evt.Message, &bridgev2.ChatInfo{
 		Name: &evt.ThreadName,
-	})
+	}, send)
 }
 
-func (ic *IGClient) handleThreadImage(portalKey networkid.PortalKey, evt *slidetypes.UpdateThreadImageEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleThreadImage(portalKey networkid.PortalKey, evt *slidetypes.UpdateThreadImageEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	return ic.handleMessageChatInfoChange(portalKey, evt.Message, &bridgev2.ChatInfo{
 		Avatar: wrapAvatar(evt.ThreadImage.URI),
-	})
+	}, send)
 }
 
-func (ic *IGClient) handleGroupJoin(portalKey networkid.PortalKey, evt *slidetypes.ParticipantJoinEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleGroupJoin(portalKey networkid.PortalKey, evt *slidetypes.ParticipantJoinEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	members := &bridgev2.ChatMemberList{
 		MemberMap: make(bridgev2.ChatMemberMap, len(evt.Thread.AsIGDirectThread.Users)),
 	}
@@ -563,20 +585,20 @@ func (ic *IGClient) handleGroupJoin(portalKey networkid.PortalKey, evt *slidetyp
 	return ic.handleMessageChatInfoChange(portalKey, evt.Message, &bridgev2.ChatInfo{
 		Name:    &evt.Thread.AsIGDirectThread.ThreadTitle,
 		Members: members,
-	})
+	}, send)
 }
 
-func (ic *IGClient) handleGroupLeave(portalKey networkid.PortalKey, evt *slidetypes.ParticipantLeaveEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleGroupLeave(portalKey networkid.PortalKey, evt *slidetypes.ParticipantLeaveEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	return ic.handleMessageChatInfoChange(portalKey, evt.Message, &bridgev2.ChatInfo{
 		Name: &evt.Thread.AsIGDirectThread.ThreadTitle,
-	}, bridgev2.ChatMember{
+	}, send, bridgev2.ChatMember{
 		EventSender: ic.makeEventSender(evt.LeftParticipantFBID),
 		Membership:  event.MembershipLeave,
 	})
 }
 
-func (ic *IGClient) dispatchRead(portalKey networkid.PortalKey, sender bridgev2.EventSender, ts time.Time) bridgev2.EventHandlingResult {
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.Receipt{
+func (ic *IGClient) dispatchRead(portalKey networkid.PortalKey, sender bridgev2.EventSender, ts time.Time, send deltaDispatcher) bridgev2.EventHandlingResult {
+	return send(&simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReadReceipt,
 			PortalKey: portalKey,
@@ -587,8 +609,8 @@ func (ic *IGClient) dispatchRead(portalKey networkid.PortalKey, sender bridgev2.
 	})
 }
 
-func (ic *IGClient) dispatchUnread(portalKey networkid.PortalKey, unread bool) bridgev2.EventHandlingResult {
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.MarkUnread{
+func (ic *IGClient) dispatchUnread(portalKey networkid.PortalKey, unread bool, send deltaDispatcher) bridgev2.EventHandlingResult {
+	return send(&simplevent.MarkUnread{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMarkUnread,
 			PortalKey: portalKey,
@@ -598,13 +620,13 @@ func (ic *IGClient) dispatchUnread(portalKey networkid.PortalKey, unread bool) b
 	})
 }
 
-func (ic *IGClient) handleMuteThread(portalKey networkid.PortalKey, isMuted bool) bridgev2.EventHandlingResult {
+func (ic *IGClient) handleMuteThread(portalKey networkid.PortalKey, isMuted bool, send deltaDispatcher) bridgev2.EventHandlingResult {
 	// The event doesn't tell us when the chat gets unmuted
 	mutedUntil := event.MutedForever
 	if !isMuted {
 		mutedUntil = bridgev2.Unmuted
 	}
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+	return send(&simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatInfoChange,
 			PortalKey: portalKey,
@@ -619,7 +641,7 @@ func (ic *IGClient) handleMuteThread(portalKey networkid.PortalKey, isMuted bool
 	})
 }
 
-func (ic *IGClient) handlePinMessages(key networkid.PortalKey, evt *slidetypes.PinMessageEvent) bridgev2.EventHandlingResult {
+func (ic *IGClient) handlePinMessages(key networkid.PortalKey, evt *slidetypes.PinMessageEvent, send deltaDispatcher) bridgev2.EventHandlingResult {
 	// TODO pinned messages aren't plumbed through bridgev2 yet
 	return bridgev2.EventHandlingResultIgnored
 }

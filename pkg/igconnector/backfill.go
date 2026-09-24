@@ -53,15 +53,19 @@ func (ic *IGClient) fetchForwardBackfill(ctx context.Context, params bridgev2.Fe
 		if err != nil {
 			return nil, fmt.Errorf("failed to get thread info: %w", err)
 		}
+		if resp == nil || resp.ThreadInfo.AsIGDirectThread == nil || resp.ThreadInfo.AsIGDirectThread.SlideMessages == nil {
+			return nil, fmt.Errorf("thread %s has no messages page", meta.IGID)
+		}
 		zerolog.Ctx(ctx).Trace().
 			Any("thread_response", resp.ThreadInfo.AsIGDirectThread).
 			Msg("Response for initial thread fetch")
 		thread = resp.ThreadInfo.AsIGDirectThread
 		params.Portal.UpdateInfo(ctx, ic.wrapChatInfo(thread), ic.UserLogin, nil, time.Time{})
 	}
+	if thread == nil || thread.SlideMessages == nil {
+		return nil, fmt.Errorf("thread info has no messages page")
+	}
 	canBackwardsBackfill := params.AnchorMessage == nil && ic.Main.Bridge.Config.Backfill.Queue.AnyEnabled()
-	needsMore := len(thread.SlideMessages.Edges) < params.Count &&
-		thread.SlideMessages.PageInfo.HasNextPage && !canBackwardsBackfill
 	cursor := thread.SlideMessages.PageInfo.EndCursor
 	var anchorID string
 	var anchorTS time.Time
@@ -87,11 +91,13 @@ func (ic *IGClient) fetchForwardBackfill(ctx context.Context, params bridgev2.Fe
 			}
 		}
 		messages = append(messages, t.Edges...)
-		cursor = t.PageInfo.EndCursor
-		needsMore = len(messages) < params.Count && t.PageInfo.HasNextPage
 	}
 	appendMessages(thread.SlideMessages)
-	for needsMore && !foundAnchor && !canBackwardsBackfill {
+	page := thread.SlideMessages
+	for len(messages) < params.Count && page.PageInfo.HasNextPage && !foundAnchor && !canBackwardsBackfill {
+		if cursor == "" {
+			return nil, fmt.Errorf("thread %s has more messages but no cursor", meta.IGID)
+		}
 		zerolog.Ctx(ctx).Debug().
 			Int("collected_count", len(messages)).
 			Int("limit", params.Count).
@@ -107,10 +113,18 @@ func (ic *IGClient) fetchForwardBackfill(ctx context.Context, params bridgev2.Fe
 		if err != nil {
 			return nil, fmt.Errorf("failed to paginate messages: %w", err)
 		}
+		if resp == nil || resp.ThreadInfo.AsIGDirectThread == nil || resp.ThreadInfo.AsIGDirectThread.Messages == nil {
+			return nil, fmt.Errorf("thread %s pagination returned no messages page", meta.IGID)
+		}
 		zerolog.Ctx(ctx).Trace().
 			Any("paginate_response", resp.ThreadInfo.AsIGDirectThread.Messages).
 			Msg("Response for pagination")
-		appendMessages(resp.ThreadInfo.AsIGDirectThread.Messages)
+		page = resp.ThreadInfo.AsIGDirectThread.Messages
+		if err = checkMessageCursor(cursor, page); err != nil {
+			return nil, fmt.Errorf("thread %s pagination: %w", meta.IGID, err)
+		}
+		appendMessages(page)
+		cursor = page.PageInfo.EndCursor
 	}
 	var markRead bool
 	for _, rr := range thread.SlideReadReceipts {
@@ -122,14 +136,63 @@ func (ic *IGClient) fetchForwardBackfill(ctx context.Context, params bridgev2.Fe
 	if thread.MarkedAsUnread {
 		markRead = false
 	}
+	converted, err := ic.wrapBackfillMessages(ctx, params.Portal, messages)
+	if err != nil {
+		return nil, err
+	}
 	return &bridgev2.FetchMessagesResponse{
-		Messages: ic.wrapBackfillMessages(ctx, params.Portal, messages),
+		Messages: converted,
 		Forward:  true,
 		MarkRead: markRead,
 	}, ctx.Err()
 }
 
 const BackfillCursorPrefix = "ig:"
+
+func checkMessageCursor(previous string, page *slidetypes.SlideMessages) error {
+	if page.PageInfo.HasNextPage && (page.PageInfo.EndCursor == "" || page.PageInfo.EndCursor == previous) {
+		return fmt.Errorf("more messages reported without a new cursor")
+	}
+	return nil
+}
+
+// FetchBootstrapThreadPage returns one source page without creating a Matrix room.
+// The caller must persist the page before requesting the returned cursor.
+func (ic *IGClient) FetchBootstrapThreadPage(ctx context.Context, threadIGID, cursor string) (*slidetypes.SlideMessages, error) {
+	if threadIGID == "" {
+		return nil, fmt.Errorf("thread ID is required")
+	}
+	var page *slidetypes.SlideMessages
+	if cursor == "" {
+		resp, err := ic.Client.GetThread(ctx, slidetypes.MakeGetThreadInfoRequest(threadIGID))
+		if err != nil {
+			return nil, fmt.Errorf("get thread %s: %w", threadIGID, err)
+		}
+		if resp != nil && resp.ThreadInfo.AsIGDirectThread != nil {
+			page = resp.ThreadInfo.AsIGDirectThread.SlideMessages
+		}
+	} else {
+		resp, err := ic.Client.PaginateMessages(ctx, &slidetypes.PaginateMessagesRequest{
+			AfterCursor:             &cursor,
+			ThreadID:                threadIGID,
+			FirstN:                  20,
+			InitialMessagePageCount: 20,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("paginate thread %s: %w", threadIGID, err)
+		}
+		if resp != nil && resp.ThreadInfo.AsIGDirectThread != nil {
+			page = resp.ThreadInfo.AsIGDirectThread.Messages
+		}
+	}
+	if page == nil {
+		return nil, fmt.Errorf("thread %s returned no messages page", threadIGID)
+	}
+	if err := checkMessageCursor(cursor, page); err != nil {
+		return nil, fmt.Errorf("thread %s: %w", threadIGID, err)
+	}
+	return page, nil
+}
 
 func (ic *IGClient) fetchBackwardBackfill(ctx context.Context, params bridgev2.FetchMessagesParams, meta *metaid.PortalMetadata) (*bridgev2.FetchMessagesResponse, error) {
 	cursorVal, ok := strings.CutPrefix(string(params.Cursor), BackfillCursorPrefix)
@@ -163,9 +226,20 @@ func (ic *IGClient) fetchBackwardBackfill(ctx context.Context, params bridgev2.F
 		if err != nil {
 			return nil, fmt.Errorf("failed to paginate messages: %w", err)
 		}
+		if resp == nil || resp.ThreadInfo.AsIGDirectThread == nil || resp.ThreadInfo.AsIGDirectThread.Messages == nil {
+			return nil, fmt.Errorf("thread %s pagination returned no messages page", meta.IGID)
+		}
 		zerolog.Ctx(ctx).Trace().
 			Any("paginate_response", resp.ThreadInfo.AsIGDirectThread.Messages).
 			Msg("Response for backwards pagination")
+		page := resp.ThreadInfo.AsIGDirectThread.Messages
+		previous := ""
+		if cursor != nil {
+			previous = *cursor
+		}
+		if err = checkMessageCursor(previous, page); err != nil {
+			return nil, fmt.Errorf("thread %s pagination: %w", meta.IGID, err)
+		}
 		messages = append(messages, resp.ThreadInfo.AsIGDirectThread.Messages.Edges...)
 		beforeMessageID = nil
 		cursor = &resp.ThreadInfo.AsIGDirectThread.Messages.PageInfo.EndCursor
@@ -174,8 +248,12 @@ func (ic *IGClient) fetchBackwardBackfill(ctx context.Context, params bridgev2.F
 	if len(messages) == 0 || cursor == nil {
 		return &bridgev2.FetchMessagesResponse{}, nil
 	}
+	converted, err := ic.wrapBackfillMessages(ctx, params.Portal, messages)
+	if err != nil {
+		return nil, err
+	}
 	return &bridgev2.FetchMessagesResponse{
-		Messages: ic.wrapBackfillMessages(ctx, params.Portal, messages),
+		Messages: converted,
 		Cursor:   networkid.PaginationCursor(BackfillCursorPrefix + *cursor),
 		HasMore:  hasMore,
 	}, ctx.Err()
@@ -183,14 +261,17 @@ func (ic *IGClient) fetchBackwardBackfill(ctx context.Context, params bridgev2.F
 
 func (ic *IGClient) wrapBackfillMessages(
 	ctx context.Context, portal *bridgev2.Portal, messages []slidetypes.Node[*slidetypes.Message],
-) []*bridgev2.BackfillMessage {
+) ([]*bridgev2.BackfillMessage, error) {
 	// Instagram returns messages newest to oldest, bridgev2 wants oldest to newest
 	slices.Reverse(messages)
 	out := make([]*bridgev2.BackfillMessage, len(messages))
 	var reactions []*metadb.IGReactionEntry
 	for i, msg := range messages {
-		if ctx.Err() != nil {
-			return nil
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if msg.Node == nil {
+			return nil, fmt.Errorf("Instagram history page contains an empty message")
 		}
 		msgID := metaid.MakeFBMessageID(msg.Node.ID)
 		sender := ic.makeEventSender(msg.Node.SenderFBID)
@@ -225,9 +306,8 @@ func (ic *IGClient) wrapBackfillMessages(
 			}
 		}
 	}
-	err := ic.Main.DB.PutManyIGReactions(ctx, portal.PortalKey, reactions)
-	if err != nil {
-		zerolog.Ctx(ctx).Err(err).Msg("Failed to store IG reaction mappings from backfill")
+	if err := ic.Main.DB.PutManyIGReactions(ctx, portal.PortalKey, reactions); err != nil {
+		return nil, fmt.Errorf("store Instagram reaction mappings: %w", err)
 	}
-	return out
+	return out, nil
 }
