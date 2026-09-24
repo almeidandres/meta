@@ -101,10 +101,28 @@ func (ic *IGClient) stageBootstrapDelta(ctx context.Context, delta *slidetypes.D
 			return false, err
 		}
 	}
+	selectedJob := false
 	if portal == nil && !selected {
-		return false, nil
+		if fbid == 0 {
+			return false, nil
+		}
+		job, err := ic.Main.Bridge.DB.GetBootstrapJob(ctx, ic.UserLogin.ID, key)
+		if err != nil {
+			return false, err
+		}
+		if job == nil && !ic.Main.Bridge.Config.SplitPortals {
+			key.Receiver = ""
+			job, err = ic.Main.Bridge.DB.GetBootstrapJob(ctx, ic.UserLogin.ID, key)
+			if err != nil {
+				return false, err
+			}
+		}
+		if job == nil || job.Status == "ready" {
+			return false, nil
+		}
+		selectedJob = true
 	}
-	if portal == nil {
+	if portal == nil && !selectedJob {
 		resp, err := ic.Client.GetThread(ctx, slidetypes.MakeGetThreadInfoRequest(threadID))
 		if err != nil {
 			return false, err
@@ -121,7 +139,7 @@ func (ic *IGClient) stageBootstrapDelta(ctx context.Context, delta *slidetypes.D
 		if err != nil {
 			return false, err
 		}
-	} else {
+	} else if portal != nil {
 		key = portal.PortalKey
 	}
 	if portal != nil && portal.MXID != "" {
